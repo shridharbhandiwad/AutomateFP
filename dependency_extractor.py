@@ -50,36 +50,62 @@ class DependencyExtractor:
             print(f"Error loading MATLAB file: {e}")
             sys.exit(1)
     
-    def numpy_to_python(self, obj: Any) -> Any:
+    def numpy_to_python(self, obj: Any, depth: int = 0, visited: Optional[set] = None) -> Any:
         """Convert numpy objects to Python native types for JSON serialization."""
+        # Initialize visited set for circular reference detection
+        if visited is None:
+            visited = set()
+        
+        # Check for maximum recursion depth
+        if depth > 50:
+            return {"error": "Maximum recursion depth reached", "type": str(type(obj))}
+        
+        # Check for circular references for objects that can be tracked
+        obj_id = id(obj)
+        if hasattr(obj, 'shape') and obj_id in visited:
+            return {"error": "Circular reference detected", "type": str(type(obj))}
+        
         if isinstance(obj, np.ndarray):
-            # Handle structured arrays
-            if obj.dtype.names is not None:
-                if obj.size == 1:
-                    result = {}
-                    for field in obj.dtype.names:
-                        result[field] = self.numpy_to_python(obj[field][0])
-                    return result
+            # Add to visited set for circular reference detection
+            visited.add(obj_id)
+            
+            try:
+                # Handle structured arrays
+                if obj.dtype.names is not None:
+                    if obj.size == 1:
+                        result = {}
+                        for field in obj.dtype.names:
+                            try:
+                                result[field] = self.numpy_to_python(obj[field][0], depth + 1, visited.copy())
+                            except Exception as e:
+                                result[field] = {"error": f"Field extraction failed: {str(e)}"}
+                        return result
+                    else:
+                        return {
+                            "type": "structured_array",
+                            "shape": obj.shape,
+                            "dtype": str(obj.dtype),
+                            "fields": obj.dtype.names,
+                            "size": obj.size
+                        }
+                elif obj.size == 1:
+                    return self.numpy_to_python(obj.item(), depth + 1, visited.copy())
+                elif obj.size < 100:  # Avoid huge arrays in JSON
+                    return obj.tolist()
                 else:
                     return {
-                        "type": "structured_array",
+                        "type": "large_array",
                         "shape": obj.shape,
                         "dtype": str(obj.dtype),
-                        "fields": obj.dtype.names,
-                        "size": obj.size
+                        "size": obj.size,
+                        "sample_values": obj.flatten()[:10].tolist()
                     }
-            elif obj.size == 1:
-                return self.numpy_to_python(obj.item())
-            elif obj.size < 100:  # Avoid huge arrays in JSON
-                return obj.tolist()
-            else:
-                return {
-                    "type": "large_array",
-                    "shape": obj.shape,
-                    "dtype": str(obj.dtype),
-                    "size": obj.size,
-                    "sample_values": obj.flatten()[:10].tolist()
-                }
+            except Exception as e:
+                return {"error": f"Array processing failed: {str(e)}", "type": str(type(obj))}
+            finally:
+                # Remove from visited set when done processing
+                visited.discard(obj_id)
+                
         elif isinstance(obj, (np.integer, np.floating)):
             return obj.item()
         elif isinstance(obj, np.bool_):
@@ -87,9 +113,9 @@ class DependencyExtractor:
         elif isinstance(obj, (np.void, np.generic)):
             return str(obj)
         elif isinstance(obj, dict):
-            return {k: self.numpy_to_python(v) for k, v in obj.items()}
+            return {k: self.numpy_to_python(v, depth + 1, visited.copy()) for k, v in obj.items()}
         elif isinstance(obj, (list, tuple)):
-            return [self.numpy_to_python(item) for item in obj]
+            return [self.numpy_to_python(item, depth + 1, visited.copy()) for item in obj]
         else:
             return obj
     
