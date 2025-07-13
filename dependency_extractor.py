@@ -50,72 +50,113 @@ class DependencyExtractor:
             print(f"Error loading MATLAB file: {e}")
             sys.exit(1)
     
-    def numpy_to_python(self, obj: Any, depth: int = 0, visited: Optional[set] = None) -> Any:
+    def numpy_to_python(self, obj: Any, max_depth: int = 10, current_depth: int = 0) -> Any:
         """Convert numpy objects to Python native types for JSON serialization."""
-        # Initialize visited set for circular reference detection
-        if visited is None:
-            visited = set()
+        # Prevent infinite recursion by checking depth limit
+        if current_depth >= max_depth:
+            return {
+                "error": "Maximum recursion depth reached",
+                "type": "depth_limited_object",
+                "original_type": str(type(obj)),
+                "current_depth": current_depth
+            }
         
-        # Check for maximum recursion depth
-        if depth > 50:
-            return {"error": "Maximum recursion depth reached", "type": str(type(obj))}
-        
-        # Check for circular references for objects that can be tracked
-        obj_id = id(obj)
-        if hasattr(obj, 'shape') and obj_id in visited:
-            return {"error": "Circular reference detected", "type": str(type(obj))}
-        
+        # Handle numpy arrays
         if isinstance(obj, np.ndarray):
-            # Add to visited set for circular reference detection
-            visited.add(obj_id)
+            array_size = obj.size  # Define array_size here for all array handling
             
-            try:
-                # Handle structured arrays
-                if obj.dtype.names is not None:
-                    if obj.size == 1:
-                        result = {}
-                        for field in obj.dtype.names:
-                            try:
-                                result[field] = self.numpy_to_python(obj[field][0], depth + 1, visited.copy())
-                            except Exception as e:
-                                result[field] = {"error": f"Field extraction failed: {str(e)}"}
-                        return result
-                    else:
-                        return {
-                            "type": "structured_array",
-                            "shape": obj.shape,
-                            "dtype": str(obj.dtype),
-                            "fields": obj.dtype.names,
-                            "size": obj.size
-                        }
-                elif obj.size == 1:
-                    return self.numpy_to_python(obj.item(), depth + 1, visited.copy())
-                elif obj.size < 100:  # Avoid huge arrays in JSON
-                    return obj.tolist()
-                else:
-                    return {
-                        "type": "large_array",
-                        "shape": obj.shape,
-                        "dtype": str(obj.dtype),
-                        "size": obj.size,
-                        "sample_values": obj.flatten()[:10].tolist()
-                    }
-            except Exception as e:
-                return {"error": f"Array processing failed: {str(e)}", "type": str(type(obj))}
-            finally:
-                # Remove from visited set when done processing
-                visited.discard(obj_id)
+            # Handle structured arrays (arrays with named fields)
+            if obj.dtype.names is not None:
+                structured_array_fields = obj.dtype.names
+                array_shape = obj.shape
                 
+                if array_size == 1:
+                    # Single element structured array - extract all fields
+                    field_values = {}
+                    for field_name in structured_array_fields:
+                        try:
+                            field_data = obj[field_name][0]
+                            field_values[field_name] = self.numpy_to_python(
+                                field_data, max_depth, current_depth + 1
+                            )
+                        except Exception as field_error:
+                            field_values[field_name] = {
+                                "error": f"Error extracting field '{field_name}': {str(field_error)}",
+                                "field_type": str(type(obj[field_name]))
+                            }
+                    
+                    return {
+                        "type": "structured_array",
+                        "shape": array_shape,
+                        "fields": list(structured_array_fields),
+                        "field_values": field_values
+                    }
+                else:
+                    # Multi-element structured array - return metadata only
+                    return {
+                        "type": "structured_array",
+                        "shape": array_shape,
+                        "dtype": str(obj.dtype),
+                        "fields": list(structured_array_fields),
+                        "size": array_size
+                    }
+            
+            # Handle regular arrays
+            elif array_size == 1:
+                # Single element array - extract the item
+                single_item = obj.item()
+                return self.numpy_to_python(single_item, max_depth, current_depth + 1)
+            
+            elif array_size < 100:  # Avoid huge arrays in JSON
+                # Small array - convert to list
+                array_as_list = obj.tolist()
+                return [self.numpy_to_python(item, max_depth, current_depth + 1) for item in array_as_list]
+            
+            else:
+                # Large array - return metadata with sample values
+                flattened_array = obj.flatten()
+                sample_values = flattened_array[:10].tolist()
+                
+                return {
+                    "type": "large_array",
+                    "shape": obj.shape,
+                    "dtype": str(obj.dtype),
+                    "size": array_size,
+                    "sample_values": sample_values
+                }
+        
+        # Handle numpy scalar types
         elif isinstance(obj, (np.integer, np.floating)):
-            return obj.item()
+            scalar_value = obj.item()
+            return scalar_value
+        
         elif isinstance(obj, np.bool_):
-            return bool(obj)
+            boolean_value = bool(obj)
+            return boolean_value
+        
         elif isinstance(obj, (np.void, np.generic)):
-            return str(obj)
+            string_representation = str(obj)
+            return string_representation
+        
+        # Handle Python containers
         elif isinstance(obj, dict):
-            return {k: self.numpy_to_python(v, depth + 1, visited.copy()) for k, v in obj.items()}
+            converted_dict = {}
+            for dict_key, dict_value in obj.items():
+                converted_dict[dict_key] = self.numpy_to_python(
+                    dict_value, max_depth, current_depth + 1
+                )
+            return converted_dict
+        
         elif isinstance(obj, (list, tuple)):
-            return [self.numpy_to_python(item, depth + 1, visited.copy()) for item in obj]
+            converted_list = []
+            for list_item in obj:
+                converted_item = self.numpy_to_python(
+                    list_item, max_depth, current_depth + 1
+                )
+                converted_list.append(converted_item)
+            return converted_list
+        
+        # Handle other types
         else:
             return obj
     
@@ -131,7 +172,7 @@ class DependencyExtractor:
     
     def get_dependency_properties(self, dep_id: int, cycle_number: int) -> Dict[str, Any]:
         """Extract all dependency object properties for a given ID and cycle."""
-        result = {
+        extraction_result = {
             "dep_id": dep_id,
             "cycle_number": cycle_number,
             "timestamp": None,
@@ -144,84 +185,120 @@ class DependencyExtractor:
         
         try:
             # Get time information
-            if self.time_data is not None and 0 <= cycle_number < len(self.time_data):
-                result["timestamp"] = float(self.time_data[cycle_number])
+            time_data_array = self.time_data
+            if time_data_array is not None and 0 <= cycle_number < len(time_data_array):
+                current_timestamp = float(time_data_array[cycle_number])
+                extraction_result["timestamp"] = current_timestamp
             
             # Navigate to the dependency values
-            list_memory = self.extract_nested_field(self.dep_data, ['m_listMemory'])
-            if list_memory is None:
-                result["error"] = "Could not access m_listMemory field"
-                return result
+            list_memory_field = self.extract_nested_field(self.dep_data, ['m_listMemory'])
+            if list_memory_field is None:
+                extraction_result["error"] = "Could not access m_listMemory field"
+                return extraction_result
             
-            m_value = self.extract_nested_field(list_memory, ['m_value'])
-            if m_value is None:
-                result["error"] = "Could not access m_value field"
-                return result
+            outer_m_value = self.extract_nested_field(list_memory_field, ['m_value'])
+            if outer_m_value is None:
+                extraction_result["error"] = "Could not access m_value field"
+                return extraction_result
             
-            inner_m_value = self.extract_nested_field(m_value, ['m_value'])
+            inner_m_value = self.extract_nested_field(outer_m_value, ['m_value'])
             if inner_m_value is None:
-                result["error"] = "Could not access inner m_value field"
-                return result
+                extraction_result["error"] = "Could not access inner m_value field"
+                return extraction_result
             
             # Check if we have structured dependency data
-            if hasattr(inner_m_value.dtype, 'names') and inner_m_value.dtype.names:
-                print(f"Available fields in dependency data: {inner_m_value.dtype.names}")
+            structured_data = inner_m_value
+            if hasattr(structured_data.dtype, 'names') and structured_data.dtype.names:
+                available_field_names = structured_data.dtype.names
+                print(f"Available fields in dependency data: {available_field_names}")
                 
                 # Extract all available fields
-                for field_name in inner_m_value.dtype.names:
+                for field_name in available_field_names:
                     try:
-                        field_data = inner_m_value[field_name][0, 0]
+                        field_data = structured_data[field_name][0, 0]
+                        field_shape = getattr(field_data, 'shape', None)
                         
                         # Handle different data types
-                        if hasattr(field_data, 'shape'):
-                            if field_data.shape == ():
+                        if field_shape is not None:
+                            if field_shape == ():
                                 # Scalar value
-                                result["properties"][field_name] = self.numpy_to_python(field_data)
-                            elif len(field_data.shape) >= 2:
+                                scalar_field_value = self.numpy_to_python(field_data, max_depth=8)
+                                extraction_result["properties"][field_name] = scalar_field_value
+                            elif len(field_shape) >= 2:
                                 # Multi-dimensional array - extract slice for given cycle
-                                if cycle_number < field_data.shape[-1]:
-                                    if len(field_data.shape) == 2:
+                                max_cycle_index = field_shape[-1]
+                                if cycle_number < max_cycle_index:
+                                    if len(field_shape) == 2:
                                         # 2D array - extract column for cycle
-                                        if dep_id < field_data.shape[0]:
-                                            result["properties"][field_name] = self.numpy_to_python(field_data[dep_id, cycle_number])
+                                        max_dep_id = field_shape[0]
+                                        if dep_id < max_dep_id:
+                                            cycle_specific_data = field_data[dep_id, cycle_number]
+                                            processed_cycle_data = self.numpy_to_python(cycle_specific_data, max_depth=8)
+                                            extraction_result["properties"][field_name] = processed_cycle_data
                                         else:
-                                            result["properties"][field_name] = self.numpy_to_python(field_data[:, cycle_number])
+                                            all_deps_cycle_data = field_data[:, cycle_number]
+                                            processed_all_deps_data = self.numpy_to_python(all_deps_cycle_data, max_depth=8)
+                                            extraction_result["properties"][field_name] = processed_all_deps_data
                                     else:
                                         # Higher dimensional array - extract relevant slice
-                                        if dep_id < field_data.shape[0]:
-                                            result["properties"][field_name] = self.numpy_to_python(field_data[dep_id, ..., cycle_number])
+                                        max_dep_id = field_shape[0]
+                                        if dep_id < max_dep_id:
+                                            high_dim_slice = field_data[dep_id, ..., cycle_number]
+                                            processed_high_dim_data = self.numpy_to_python(high_dim_slice, max_depth=8)
+                                            extraction_result["properties"][field_name] = processed_high_dim_data
                                         else:
-                                            result["properties"][field_name] = self.numpy_to_python(field_data[..., cycle_number])
+                                            all_deps_high_dim_slice = field_data[..., cycle_number]
+                                            processed_all_deps_high_dim = self.numpy_to_python(all_deps_high_dim_slice, max_depth=8)
+                                            extraction_result["properties"][field_name] = processed_all_deps_high_dim
                                 else:
-                                    result["properties"][field_name] = f"Cycle {cycle_number} out of range (max: {field_data.shape[-1]-1})"
+                                    cycle_out_of_range_message = f"Cycle {cycle_number} out of range (max: {max_cycle_index-1})"
+                                    extraction_result["properties"][field_name] = cycle_out_of_range_message
                             else:
                                 # 1D array or other format
-                                result["properties"][field_name] = self.numpy_to_python(field_data)
+                                one_dim_field_data = self.numpy_to_python(field_data, max_depth=8)
+                                extraction_result["properties"][field_name] = one_dim_field_data
                         else:
-                            result["properties"][field_name] = self.numpy_to_python(field_data)
+                            # No shape attribute - treat as is
+                            unstructured_field_data = self.numpy_to_python(field_data, max_depth=8)
+                            extraction_result["properties"][field_name] = unstructured_field_data
                     
-                    except Exception as e:
-                        result["properties"][field_name] = f"Error extracting field: {str(e)}"
+                    except Exception as field_extraction_error:
+                        error_message = f"Error extracting field: {str(field_extraction_error)}"
+                        extraction_result["properties"][field_name] = error_message
                         
             else:
                 # If not structured, treat as array data
-                if hasattr(inner_m_value, 'shape') and len(inner_m_value.shape) >= 2:
-                    if dep_id < inner_m_value.shape[0] and cycle_number < inner_m_value.shape[-1]:
-                        result["properties"]["array_data"] = self.numpy_to_python(inner_m_value[dep_id, cycle_number])
+                unstructured_data = structured_data
+                if hasattr(unstructured_data, 'shape') and len(unstructured_data.shape) >= 2:
+                    data_shape = unstructured_data.shape
+                    max_dep_id = data_shape[0]
+                    max_cycle_index = data_shape[-1]
+                    
+                    if dep_id < max_dep_id and cycle_number < max_cycle_index:
+                        array_element = unstructured_data[dep_id, cycle_number]
+                        processed_array_element = self.numpy_to_python(array_element, max_depth=8)
+                        extraction_result["properties"]["array_data"] = processed_array_element
                     else:
-                        result["error"] = f"Index out of bounds: dep_id={dep_id}, cycle={cycle_number}, shape={inner_m_value.shape}"
+                        bounds_error_message = f"Index out of bounds: dep_id={dep_id}, cycle={cycle_number}, shape={data_shape}"
+                        extraction_result["error"] = bounds_error_message
                 else:
-                    result["properties"]["raw_data"] = self.numpy_to_python(inner_m_value)
+                    raw_data_converted = self.numpy_to_python(unstructured_data, max_depth=8)
+                    extraction_result["properties"]["raw_data"] = raw_data_converted
             
             # Add general metadata
-            result["metadata"]["total_cycles"] = len(self.time_data) if self.time_data is not None else "unknown"
-            result["metadata"]["data_shape"] = str(self.dep_data.shape)
-            result["metadata"]["available_fields"] = list(self.dep_data.dtype.names) if hasattr(self.dep_data.dtype, 'names') else []
+            total_cycles = len(time_data_array) if time_data_array is not None else "unknown"
+            data_shape_str = str(self.dep_data.shape)
+            available_fields_list = list(self.dep_data.dtype.names) if hasattr(self.dep_data.dtype, 'names') else []
             
-        except Exception as e:
-            result["error"] = f"Error extracting dependency properties: {str(e)}"
+            extraction_result["metadata"]["total_cycles"] = total_cycles
+            extraction_result["metadata"]["data_shape"] = data_shape_str
+            extraction_result["metadata"]["available_fields"] = available_fields_list
+            
+        except Exception as general_error:
+            error_message = f"Error extracting dependency properties: {str(general_error)}"
+            extraction_result["error"] = error_message
         
-        return result
+        return extraction_result
     
     def get_available_cycles(self) -> List[int]:
         """Get list of available cycle numbers."""
